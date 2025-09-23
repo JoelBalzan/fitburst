@@ -22,7 +22,7 @@ class SpectrumModeler:
 
     def __init__(self, freqs: float, times: float, dm_incoherent: float = 0.,
         factor_freq_upsample: int = 1, factor_time_upsample: int = 1, num_components: int = 1,
-        is_dedispersed: bool = False, is_folded: bool = False, scintillation: bool = False, 
+        is_dedispersed: bool = False, is_folded: bool = False, scintillation: bool = False,
         verbose: bool = False) -> None:
         """
         Instantiates the model object and sets relevant parameters, depending on
@@ -83,9 +83,24 @@ class SpectrumModeler:
 
         # derive some additional data needed for downstream fitting.
         self.num_freq = len(self.freqs)
-        self.num_time = len(self.times)
+        self.num_time = self.times.shape[-1]
         self.res_freq = np.fabs(self.freqs[1] - self.freqs[0])
-        self.res_time = np.fabs(self.times[1] - self.times[0])
+        self.res_time = np.fabs(self.times[..., 1] - self.times[..., 0])
+
+        # determine if the times array is frequency dependent
+        if self.times.ndim == 1:
+            self.has_freq_dependent_times = False
+
+        elif self.times.ndim == 2:
+            if self.times.shape[0] != self.num_freq:
+                raise RuntimeError("times array has more than one dimension, "
+                                   "but first dimension does not match frequency axis.")
+
+            self.has_freq_dependent_times = True
+
+        else:
+            raise RuntimeError("Do not recognize shape of times array. "
+                               "Must be either (ntime,) or (nfreq, ntime).")
 
         # define all *fittable* model parameters first.
         # NOTE: 'ref_freq' is not listed here as it's a parameter that is always held fixed.
@@ -104,7 +119,7 @@ class SpectrumModeler:
         # now instantiate parameter attributes and set initially to NoneType.
         for current_parameter in self.parameters:
             setattr(self, current_parameter, None)
- 
+
         # now instantiate the structures for per-component models, time differences, and temporal profiles.
         # (the following are used for computing derivatives and/or per-channel amplitudes.)
         self.amplitude_per_component = np.zeros(
@@ -146,6 +161,13 @@ class SpectrumModeler:
         # loop over all components.
         for current_freq in range(self.num_freq):
 
+            if self.has_freq_dependent_times:
+                times = self.times[current_freq]
+                res_time = self.res_time[current_freq]
+            else:
+                times = self.times
+                res_time = self.res_time
+
             # now loop over bandpass.
             for current_component in range(self.num_components):
 
@@ -180,8 +202,15 @@ class SpectrumModeler:
                     self.factor_freq_upsample
                 )
 
-                # first, compute "full" delays for all upsampled frequency labels.
-                relative_delay = rt.ism.compute_time_dm_delay(
+                # create an upsampled version of the times label
+                current_times = rt.manipulate.upsample_1d(
+                    times,
+                    res_time,
+                    self.factor_time_upsample
+                )
+
+                # first, compute arrival time for all upsampled frequency labels.
+                arrival_time_vs_freq = current_arrival_time + rt.ism.compute_time_dm_delay(
                     self.dm_incoherent + current_dm,
                     general["constants"]["dispersion"],
                     current_dm_index,
@@ -189,24 +218,22 @@ class SpectrumModeler:
                     freq2=current_ref_freq,
                 )
 
-                # then compute "relative" delays with respect to central frequency.
-                relative_delay -= rt.ism.compute_time_dm_delay(
-                    self.dm_incoherent,
-                    general["constants"]["dispersion"],
-                    current_dm_index,
-                    self.freqs[current_freq],
-                    freq2=current_ref_freq,
-                )
+                if not self.has_freq_dependent_times:
 
-                # now compute current-times array corrected for relative delay.
-                current_times = rt.manipulate.upsample_1d(
-                    self.times.copy() - current_arrival_time,
-                    self.res_time,
-                    self.factor_time_upsample
-                )
+                    # if the time axis is shared across all freqs,
+                    # incoherent dedispersion has already aligned to
+                    # `ref_freq`. Remove that alignment here so the
+                    # residual DM term is applied consistently per channel.
+                    arrival_time_vs_freq -= rt.ism.compute_time_dm_delay(
+                        self.dm_incoherent,
+                        general["constants"]["dispersion"],
+                        current_dm_index,
+                        self.freqs[current_freq],
+                        freq2=current_ref_freq,
+                    )
 
-                current_times_arr, _ = np.meshgrid(current_times, current_freq_arr)
-                current_times_arr -= relative_delay[:, None]
+                # calculate time relative to the arrival time at each frequency
+                current_times_arr = current_times - arrival_time_vs_freq[:, None]
 
                 # before proceeding, compute and save the per-component time difference map.
                 self.timediff_per_component[current_freq, :, current_component] = \
@@ -253,7 +280,7 @@ class SpectrumModeler:
                     current_sp_idx,
                     current_sp_run
                 ) * (10 ** current_amplitude)
-                self.spectrum_per_component[current_freq, :, current_component] = (10 ** current_amplitude) * current_profile 
+                self.spectrum_per_component[current_freq, :, current_component] = (10 ** current_amplitude) * current_profile
 
                 # print spectral index/running for current component.
                 if current_freq == 0:
@@ -273,7 +300,7 @@ class SpectrumModeler:
                 # now compute model with per-channel amplitudes determined.
                 for component in range(self.num_components):
                     current_profile = self.timeprof_per_component[freq, :, component]
-                    self.amplitude_per_component[freq, :, component] = current_amplitudes[component] 
+                    self.amplitude_per_component[freq, :, component] = current_amplitudes[component]
                     self.spectrum_per_component[freq, :, component] = current_amplitudes[component] * current_profile
 
         return np.sum(self.spectrum_per_component, axis=2)
@@ -330,7 +357,7 @@ class SpectrumModeler:
             stop = times[:, -1] + (res_time * times.shape[1])
             times_extended = np.linspace(start=start, stop=stop, num=times.shape[1], axis=1)
             times_copy = np.append(times, times_extended, axis=1)
-        
+
         # compute either Gaussian or pulse-broadening function, depending on inputs.
         profile = np.zeros(times_copy.shape, dtype=float)
         sc_time = sc_time_ref * (freqs / ref_freq) ** sc_index
