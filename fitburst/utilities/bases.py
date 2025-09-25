@@ -247,6 +247,16 @@ class ReaderBaseClass:
         mask_freq = np.sum(self.data_weights, -1)
         good_freq = mask_freq != 0
 
+        # before using the data, determine if there are NaNs are zero-weight them.
+        there_are_NaNs = np.isnan(self.data_full).any()
+        
+        if there_are_NaNs:
+            print(f"WARNING: NaNs are present in the data!")
+            num_nans = int(np.sum(np.isnan(self.data_full)))
+            print(f"  * {num_nans} samples have NaNs")
+            print(f"  * ... setting to zero ...")
+            self.data_full[np.isnan(self.data_full)] = 0.
+
         # just to be sure, loop over data and ensure channels aren't "bad".
         for idx_freq in range(self.num_freq):
             if good_freq[idx_freq]:
@@ -254,7 +264,7 @@ class ReaderBaseClass:
                     print(f"ERROR: bad data value of {self.data_full[idx_freq, :].min()} in channel {idx_freq}!")
                     good_freq[idx_freq] = False
 
-        # if desired, normalize data and remove baseline.
+        # normalize data and remove baseline.
         mean_spectrum = np.sum(self.data_full * self.data_weights, -1)
         #good_freq[np.where(mean_spectrum == 0.)] = False
         mean_spectrum[good_freq] /= mask_freq[good_freq]
