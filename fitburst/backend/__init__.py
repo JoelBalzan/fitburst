@@ -25,4 +25,3 @@ telescopes = yaml.load(
 
 # now import the format-specific module files.
 from . import generic
-from . import chimefrb
