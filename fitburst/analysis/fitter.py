@@ -202,7 +202,7 @@ class LSFitter:
         parameter_dict = self.model.get_parameters_dict()
 
         # define the scale of the Jacobian matrix.
-        num_points = len(self.model.times) * len(self.model.freqs)
+        num_points = self.model.num_time * self.model.num_freq
         jacobian = np.zeros((num_points, len(parameter_list)), dtype=float)
         current_parameter_idx = 0
 
