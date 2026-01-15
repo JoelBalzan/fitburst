@@ -198,9 +198,9 @@ class ReaderBaseClass:
 
         sys.exit("ERROR: load_data() must be defined for input data format!")
 
-    def preprocess_data(self, apply_cut_variance: bool = False, apply_cut_skewness: bool = False, 
-                        normalize_variance: bool = True, remove_baseline: bool = False, 
-                        skewness_range: list = [-3., 3.], variance_range: list = [0.2, 0.8], 
+    def preprocess_data(self, apply_cut_variance: bool = False, apply_cut_skewness: bool = False,
+                        normalize_variance: bool = True, remove_baseline: bool = False,
+                        skewness_range: list = [-3., 3.], variance_range: list = [0.2, 0.8],
                         variance_weight: float = 1.) -> None:
         """
         Applies pre-fit routines for cleaning raw dynamic spectrum (e.g., RFI-masking,
@@ -209,11 +209,11 @@ class ReaderBaseClass:
         Parameters
         ----------
         apply_cut_variance : bool, optional
-            if True, then update mask to exclude channels with variance values that exceed 
+            if True, then update mask to exclude channels with variance values that exceed
             the range specified in the 'variance_range' list
 
         apply_cut_skewness : bool, optional
-            if True, then update mask to exclude channels with skewness values that exceed 
+            if True, then update mask to exclude channels with skewness values that exceed
             the range specified in the 'skewness_range' list
 
         normalize_variance: bool, optional
@@ -247,6 +247,16 @@ class ReaderBaseClass:
         mask_freq = np.sum(self.data_weights, -1)
         good_freq = mask_freq != 0
 
+        # before using the data, determine if there are NaNs are zero-weight them.
+        there_are_NaNs = np.isnan(self.data_full).any()
+        
+        if there_are_NaNs:
+            print(f"WARNING: NaNs are present in the data!")
+            num_nans = int(np.sum(np.isnan(self.data_full)))
+            print(f"  * {num_nans} samples have NaNs")
+            print(f"  * ... setting to zero ...")
+            self.data_full[np.isnan(self.data_full)] = 0.
+
         # just to be sure, loop over data and ensure channels aren't "bad".
         for idx_freq in range(self.num_freq):
             if good_freq[idx_freq]:
@@ -254,7 +264,7 @@ class ReaderBaseClass:
                     print(f"ERROR: bad data value of {self.data_full[idx_freq, :].min()} in channel {idx_freq}!")
                     good_freq[idx_freq] = False
 
-        # if desired, normalize data and remove baseline.
+        # normalize data and remove baseline.
         mean_spectrum = np.sum(self.data_full * self.data_weights, -1)
         #good_freq[np.where(mean_spectrum == 0.)] = False
         mean_spectrum[good_freq] /= mask_freq[good_freq]
@@ -278,7 +288,7 @@ class ReaderBaseClass:
             variance[good_freq] /= np.max(variance[good_freq])
 
         # now update good-frequencies list based on variance/skewness thresholds.
-        if apply_cut_variance: 
+        if apply_cut_variance:
             good_freq = np.logical_and(good_freq, (variance / variance_weight < variance_range[1]))
             good_freq = np.logical_and(good_freq, (variance / variance_weight > variance_range[0]))
 
@@ -334,3 +344,54 @@ class ReaderBaseClass:
         ]
 
         return data_windowed, times_windowed
+
+    def window_all(self, arrival_time: float, window: float = 0.08) -> tuple:
+        """
+        Returns a subset of data, weights, and times centered on the arrival time.
+
+        Parameters
+        ----------
+        arrival_time : np.float
+            arrival time of the burst, in units of seconds.
+
+        window : np.float, optional
+            half-range extent of window, in units of seconds.
+
+        Returns
+        -------
+        data_windowed : np.ndarray of shape (nfreq, ntime)
+            The dedispersed, windowed dynamic spectrum.  Values are set to zero
+            where the requested window extends beyond the available time range.
+
+        weights_windowed : np.ndarray of shape (nfreq, ntime)
+            Sample weights aligned with ``data_windowed``. Values are set to zero
+            where the requested window extends beyond the available time range.
+
+        times_windowed : np.ndarray of shape (nfreq, ntime)
+            Timestamps corresponding to ``data_windowed``.
+        """
+
+        num_window_bins = np.around(window / self.res_time).astype(int)
+        data_windowed = np.zeros((self.num_freq, num_window_bins * 2), dtype=float)
+        weights_windowed = np.zeros((self.num_freq, num_window_bins * 2), dtype=float)
+        times_windowed = np.zeros((self.num_freq, num_window_bins * 2), dtype=float)
+
+        # compute indeces of min/max window values along time axis.
+        for idx_freq in range(self.num_freq):
+            current_arrival_idx = self.dedispersion_idx[idx_freq]
+
+            a = current_arrival_idx - num_window_bins
+            b = current_arrival_idx + num_window_bins
+
+            ia = np.clip(a, 0, self.num_time)
+            ib = np.clip(b, 0, self.num_time)
+
+            oa = max(0, -a)
+            ob = oa + max(0, ib - ia)
+
+            if ib > ia:
+                data_windowed[idx_freq, oa:ob] = self.data_full[idx_freq, ia:ib]
+                weights_windowed[idx_freq, oa:ob] = self.data_weights[idx_freq, ia:ib]
+                times_windowed[idx_freq, oa:ob] = self.times[ia:ib]
+
+        return data_windowed, times_windowed, weights_windowed
