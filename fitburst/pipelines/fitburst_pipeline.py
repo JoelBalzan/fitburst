@@ -2,21 +2,22 @@
 
 # configure backend for matplotlib.
 import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
-from fitburst.analysis.peak_finder import FindPeak
-from fitburst.backend.generic import DataReader
-from fitburst.analysis.fitter import LSFitter
-from fitburst.analysis.model import SpectrumModeler
-from copy import deepcopy
-import fitburst.routines.manipulate as manip
-import fitburst.utilities as ut
-import numpy as np
+matplotlib.use("Agg")
 import argparse
 import json
-import sys
 import os
+import sys
+from copy import deepcopy
+
+import fitburst.routines.manipulate as manip
+import fitburst.utilities as ut
+import matplotlib.pyplot as plt
+import numpy as np
+from fitburst.analysis.fitter import LSFitter
+from fitburst.analysis.model import SpectrumModeler
+from fitburst.analysis.peak_finder import FindPeak
+from fitburst.backend.generic import DataReader
 
 parser = argparse.ArgumentParser(description=
     "A Python3 script that uses fitburst API to read, preprocess, and fit " +  
@@ -364,12 +365,31 @@ print(f"INFO: there are {data.num_freq} frequencies and {data.num_time} time sam
 data.good_freq = np.sum(data.data_weights, axis=1) != 0.
 data.good_freq = np.sum(data.data_full, axis=1) != 0.
 
+# Mark bad channels from metadata as not good
+if hasattr(data, 'bad_chans') and data.bad_chans is not None and len(data.bad_chans) > 0:
+    print(f"INFO: marking {len(data.bad_chans)} bad channels from metadata: {data.bad_chans}")
+    for bad_idx in data.bad_chans:
+        if 0 <= bad_idx < data.num_freq:
+            data.good_freq[bad_idx] = False
+
 # just to be sure, loop over data and ensure channels aren't "bad".
 for idx_freq in range(data.num_freq):
     if data.good_freq[idx_freq]:
         if data.data_full[idx_freq, :].min() == data.data_full[idx_freq, :].max():
             print(f"ERROR: bad data value of {data.data_full[idx_freq, :].min()} in channel {idx_freq}!")
             data.good_freq[idx_freq] = False
+        # Also check for NaN values
+        if np.any(np.isnan(data.data_full[idx_freq, :])):
+            print(f"WARNING: NaN values found in channel {idx_freq}, marking as bad!")
+            data.good_freq[idx_freq] = False
+
+# Also check for NaN in time samples across all frequencies
+nan_time_samples = np.any(np.isnan(data.data_full), axis=0)
+if np.any(nan_time_samples):
+    print(f"WARNING: Found {np.sum(nan_time_samples)} time samples with NaN values")
+    # Replace NaN values with 0 in the data
+    data.data_full = np.nan_to_num(data.data_full, nan=0.0)
+    print(f"INFO: Replaced NaN values with 0.0")
 
 if preprocess_data:
     data.preprocess_data(normalize_variance=True, variance_range=variance_range)
