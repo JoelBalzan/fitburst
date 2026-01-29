@@ -484,13 +484,14 @@ if verbose:
 
 # now compute dedisperse matrix for data, given initial DM (or DM offset), 
 # and grab windowed data.
-print("INFO: computing dedispersion-index matrix")
-data.dedisperse(
-    initial_parameters["dm"][0],
-    current_parameters["arrival_time"][0],
-    ref_freq=initial_parameters["ref_freq"][0],
-    dm_offset=0.0
-)
+if not data.is_dedispersed:
+    print("INFO: computing dedispersion-index matrix")
+    data.dedisperse(
+        initial_parameters["dm"][0],
+        current_parameters["arrival_time"][0],
+        ref_freq=initial_parameters["ref_freq"][0],
+        dm_offset=0.0
+    )
 
 data_windowed = data.data_full
 times_windowed = data.times
