@@ -7,11 +7,14 @@ object. The LSFitter defines several methods to handle the fixing and fitting
 of one or more parameters.
 """
 
-from scipy.optimize import least_squares
-import fitburst.routines.derivative as deriv
-import numpy as np
-import traceback
 import sys
+import traceback
+
+import numpy as np
+from scipy.optimize import least_squares
+
+import fitburst.routines.derivative as deriv
+
 
 class LSFitter:
     """
@@ -479,14 +482,41 @@ class LSFitter:
 
         try:
             hessian_approx = fit_result.jac.T.dot(fit_result.jac)
-            covariance_approx = np.linalg.inv(hessian_approx)
+            
+            # Try regular inverse first, fall back to pseudoinverse if singular
+            try:
+                covariance_approx = np.linalg.inv(hessian_approx)
+            except np.linalg.LinAlgError:
+                print("WARNING: approximate Hessian is singular, using pseudoinverse...")
+                covariance_approx = np.linalg.pinv(hessian_approx)
+            
             hessian, par_labels = self.compute_hessian(self.data, self.fit_parameters)
-            covariance = np.linalg.inv(0.5 * hessian)
-            uncertainties = [float(x) for x in np.sqrt(np.diag(covariance)).tolist()]
+            
+            try:
+                covariance = np.linalg.inv(0.5 * hessian)
+            except np.linalg.LinAlgError:
+                print("WARNING: exact Hessian is singular, using pseudoinverse...")
+                covariance = np.linalg.pinv(0.5 * hessian)
+            
+            # Compute uncertainties, handling negative diagonal elements
+            diag_cov = np.diag(covariance)
+            uncertainties = []
+            for val in diag_cov:
+                if val >= 0:
+                    uncertainties.append(float(np.sqrt(val)))
+                else:
+                    uncertainties.append(float('nan'))
 
             if np.any(np.isnan(uncertainties)):
                 print("WARNING: one or more NaNs in exact uncertainties, replacing with approximates...")
-                uncertainties = [float(x) for x in np.sqrt(np.diag(covariance_approx)).tolist()]
+                diag_cov_approx = np.diag(covariance_approx)
+                uncertainties_approx = []
+                for val in diag_cov_approx:
+                    if val >= 0:
+                        uncertainties_approx.append(float(np.sqrt(val)))
+                    else:
+                        uncertainties_approx.append(float('nan'))
+                uncertainties = uncertainties_approx
 
             self.covariance_approx = covariance_approx
             self.covariance = covariance
@@ -501,6 +531,11 @@ class LSFitter:
         except Exception as exc:
             print(f"ERROR: {exc}; designating fit as unsuccessful...")
             print(traceback.format_exc())
+            # Set uncertainties to NaN for all parameters to avoid downstream errors
+            num_params = len(fit_result.x)
+            uncertainties = [float('nan')] * num_params
+            self.fit_statistics["bestfit_uncertainties"] = self.load_fit_parameters_list(
+                uncertainties)
             self.success = False
 
     def _set_weights(self) -> None:
