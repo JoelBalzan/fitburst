@@ -374,6 +374,7 @@ def build_fitburst_npz_from_summary(
     override_df: Optional[float] = None,
     override_scattering: Optional[float] = None,
     min_peak_snr: float = 6.0,
+    max_peaks: int = 5,
 ) -> str:
     """Create a fitburst-compatible .npz for Stokes I using the summary.
 
@@ -516,7 +517,7 @@ def build_fitburst_npz_from_summary(
     # If no arrival_time is supplied, find the main peak in the dynspec.
     if arrival_time is None:
         arrival_times, peak_amplitudes, burst_widths, scattering_timescales = find_peak_arrival_times(
-            data_full, dt, min_peak_snr=min_peak_snr
+            data_full, dt, min_peak_snr=min_peak_snr, max_peaks=max_peaks
         )
         num_components = len(arrival_times)
         
@@ -690,6 +691,15 @@ def main(argv=None) -> int:
             "the time window). Default: 6.0."
         ),
     )
+    parser.add_argument(
+        "--max-peaks",
+        type=int,
+        default=5,
+        help=(
+            "Maximum number of peaks to detect in the dynamic spectrum. "
+            "Default: 5."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -704,6 +714,7 @@ def main(argv=None) -> int:
         override_df=args.df,
         override_scattering=args.scattering,
         min_peak_snr=args.min_snr,
+        max_peaks=args.max_peaks,
     )
     # Nothing else to do; pipeline should be run separately.
     return 0
