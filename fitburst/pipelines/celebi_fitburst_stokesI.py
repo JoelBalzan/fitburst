@@ -141,6 +141,205 @@ def infer_freq_axis(cfreq_mhz: float, bw_mhz: float, num_chan: int) -> Tuple[flo
     return freq0, df
 
 
+def measure_spectral_parameters(
+    data: np.ndarray,
+    peak_idx: int,
+    freqs_mhz: np.ndarray,
+    ref_freq_mhz: float,
+    time_window: int = 5,
+    min_chan_snr: float = 2.0,
+) -> Tuple[float, float]:
+    """Estimate (spectral_index, spectral_running) at a given peak time.
+
+    Uses a simple quadratic fit in log-space:
+        ln S(f) = c0 + alpha * ln(f/f_ref) + beta * ln(f/f_ref)^2
+
+    where alpha is the spectral index and beta is the spectral running.
+
+    The spectrum is taken around the peak time. For very narrow pulses we
+    use the per-channel maximum in the window (to avoid diluting the signal);
+    for broader pulses we use a per-channel mean.
+
+    A per-channel baseline and noise are estimated robustly across the full
+    time axis (median and MAD). Channels are selected based on a simple
+    per-channel SNR threshold and the fit is noise-weighted.
+
+    Returns (0.0, 0.0) if a fit cannot be performed.
+    """
+    if data.ndim != 2:
+        return 0.0, 0.0
+
+    num_time = data.shape[1]
+    if num_time < 3:
+        return 0.0, 0.0
+
+    if time_window < 1:
+        time_window = 1
+
+    peak_idx = int(peak_idx)
+    if peak_idx < 0 or peak_idx >= num_time:
+        return 0.0, 0.0
+
+    half_window = time_window // 2
+    t_start = max(0, peak_idx - half_window)
+    t_end = min(num_time, peak_idx + half_window + 1)
+
+    # Robust per-channel baseline/noise across all times.
+    baseline_spec = np.nanmedian(data, axis=1)
+    mad_spec = np.nanmedian(np.abs(data - baseline_spec[:, None]), axis=1)
+    noise_spec = 1.4826 * mad_spec
+    # Fallback if MAD is degenerate.
+    bad_noise = ~np.isfinite(noise_spec) | (noise_spec <= 0)
+    if np.any(bad_noise):
+        noise_spec = noise_spec.copy()
+        noise_spec[bad_noise] = np.nanstd(data[bad_noise, :], axis=1)
+
+    window = data[:, t_start:t_end]
+    # Use max for narrow windows, mean otherwise.
+    if (t_end - t_start) <= 3:
+        spec_raw = np.nanmax(window, axis=1)
+    else:
+        spec_raw = np.nanmean(window, axis=1)
+
+    spectrum = spec_raw - baseline_spec
+    snr = spectrum / (noise_spec + 1e-30)
+
+    valid_mask = (
+        np.isfinite(freqs_mhz)
+        & np.isfinite(spectrum)
+        & np.isfinite(snr)
+        & (freqs_mhz > 0)
+        & (spectrum > 0)
+        & (snr >= float(min_chan_snr))
+    )
+    n_valid = int(np.count_nonzero(valid_mask))
+    if n_valid < 3:
+        return 0.0, 0.0
+
+    x = np.log(freqs_mhz[valid_mask] / float(ref_freq_mhz))
+    y = np.log(spectrum[valid_mask])
+    w = np.clip(snr[valid_mask], 0.0, 50.0)
+
+    # Guard against a degenerate design (all x identical, etc.).
+    if not np.isfinite(x).all() or np.nanstd(x) <= 0:
+        return 0.0, 0.0
+
+    try:
+        if n_valid >= 5:
+            # np.polyfit returns [c2, c1, c0] for deg=2: y = c2*x^2 + c1*x + c0
+            c2, c1, _c0 = np.polyfit(x, y, deg=2, w=w)
+            spectral_running = float(c2)
+            spectral_index = float(c1)
+        else:
+            # Too few points for a stable quadratic; fall back to pure power-law.
+            c1, _c0 = np.polyfit(x, y, deg=1, w=w)
+            spectral_running = 0.0
+            spectral_index = float(c1)
+    except Exception:
+        return 0.0, 0.0
+
+    # Keep guesses in a reasonable range to avoid pathological starts.
+    if not np.isfinite(spectral_index) or not (-10.0 <= spectral_index <= 10.0):
+        spectral_index = 0.0
+    if not np.isfinite(spectral_running) or not (-50.0 <= spectral_running <= 50.0):
+        spectral_running = 0.0
+
+    return spectral_index, spectral_running
+
+
+def write_diagnostic_plot(
+    *,
+    data: np.ndarray,
+    dt: float,
+    freqs_mhz: np.ndarray,
+    arrival_times_s: List[float],
+    output_path: str,
+    title: Optional[str] = None,
+) -> None:
+    """Write a diagnostic plot: pulse profile + dynamic spectrum with labeled peaks."""
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[CELEBI→fitburst] Diagnostic plot skipped (matplotlib unavailable): {e}")
+        return
+
+    if data.ndim != 2:
+        print("[CELEBI→fitburst] Diagnostic plot skipped (data not 2D)")
+        return
+
+    num_freq, num_time = data.shape
+    if num_time < 2 or num_freq < 2:
+        print("[CELEBI→fitburst] Diagnostic plot skipped (data too small)")
+        return
+
+    times_s = np.arange(num_time) * float(dt)
+    profile = np.nanmean(data, axis=0)
+
+    fig = plt.figure(figsize=(11, 7), constrained_layout=True)
+    gs = fig.add_gridspec(2, 1, height_ratios=[1.0, 3.0])
+
+    ax_top = fig.add_subplot(gs[0, 0])
+    ax_ds = fig.add_subplot(gs[1, 0], sharex=ax_top)
+
+    # Top: pulse profile
+    ax_top.plot(times_s, profile, lw=1.0, color="k")
+    ax_top.set_ylabel("Profile (mean over freq)")
+    ax_top.grid(True, alpha=0.2)
+
+    # Bottom: dynamic spectrum
+    # Choose robust scaling to make structure visible.
+    vmin, vmax = np.nanpercentile(data, [5, 99])
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        vmin, vmax = None, None
+
+    extent = [times_s[0], times_s[-1], float(freqs_mhz[0]), float(freqs_mhz[-1])]
+    im = ax_ds.imshow(
+        data,
+        aspect="auto",
+        origin="upper",
+        extent=extent,
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="nearest",
+    )
+    ax_ds.set_xlabel("Time since bin0 (s)")
+    ax_ds.set_ylabel("Frequency (MHz)")
+    cbar = fig.colorbar(im, ax=ax_ds, pad=0.01)
+    cbar.set_label("Intensity")
+
+    # Mark and label peaks
+    y_text = np.nanmax(profile)
+    if not np.isfinite(y_text):
+        y_text = 0.0
+
+    for i, t_s in enumerate(arrival_times_s, start=1):
+        ax_top.axvline(t_s, color="C1", lw=1.0, alpha=0.8)
+        ax_ds.axvline(t_s, color="C1", lw=1.0, alpha=0.8)
+        ax_top.text(
+            t_s,
+            y_text,
+            f"{i}",
+            color="C1",
+            fontsize=9,
+            ha="center",
+            va="bottom",
+        )
+
+    if title:
+        fig.suptitle(title)
+    else:
+        fig.suptitle("fitburst diagnostic: detected components")
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"[CELEBI→fitburst] Wrote diagnostic plot: {output_path}")
+
+
 def measure_scattering_timescale(
     time_series: np.ndarray,
     peak_idx: int,
@@ -213,13 +412,16 @@ def measure_scattering_timescale(
 def find_peak_arrival_times(
     data: np.ndarray, 
     dt: float,
+    freqs_mhz: np.ndarray,
+    ref_freq_mhz: float,
+    cfreq_mhz: float,
     min_peak_snr: float = 6.0,
     max_peaks: int = 5,
-) -> Tuple[List[float], List[float], List[float], List[float]]:
+) -> Tuple[List[float], List[float], List[float], List[float], List[float], List[float]]:
     """Find significant peaks in a dynamic spectrum.
 
     Collapses the dynspec along the frequency axis (ignoring NaNs) and finds
-    significant peaks above noise. Measures FWHM and scattering timescale for each.
+    significant peaks above noise. Measures width (sigma) and scattering timescale for each.
 
     Parameters
     ----------
@@ -227,6 +429,12 @@ def find_peak_arrival_times(
         2D dynamic spectrum (num_freq, num_time)
     dt : float
         Time resolution in seconds
+    freqs_mhz: np.ndarray
+        Frequency axis in MHz
+    ref_freq_mhz: float
+        Reference frequency in MHz
+    cfreq_mhz: float
+        Center frequency in MHz (for scaling scattering timescale)
     min_peak_snr : float, optional
         Minimum signal-to-noise ratio for a peak to be considered significant
     max_peaks : int, optional
@@ -239,9 +447,13 @@ def find_peak_arrival_times(
     peak_amplitudes : List[float]
         List with log10 amplitude for each peak
     burst_widths : List[float]
-        List with FWHM width in seconds for each peak
+        List with sigma (standard deviation) width in seconds for each peak
     scattering_timescales : List[float]
         List with scattering timescale in seconds for each peak
+    spectral_indices : List[float]
+        List with spectral index for each peak
+    spectral_runnings : List[float]
+        List with spectral running for each peak
     """
     # Collapse to 1D time series by averaging over frequency (ignoring NaNs)
     time_series = np.nanmean(data, axis=0)
@@ -254,7 +466,16 @@ def find_peak_arrival_times(
         peak_amplitudes = [float(np.log10(np.nanmax(data)))]
         burst_widths = [1e-3]  # Default 1 ms
         scattering_timescales = [0.0]
-        return arrival_times, peak_amplitudes, burst_widths, scattering_timescales
+        spectral_indices = [0.0]
+        spectral_runnings = [0.0]
+        return (
+            arrival_times,
+            peak_amplitudes,
+            burst_widths,
+            scattering_timescales,
+            spectral_indices,
+            spectral_runnings,
+        )
     
     # Calculate noise statistics from off-pulse region
     # Use first 5% of the time series as off-pulse baseline
@@ -284,20 +505,29 @@ def find_peak_arrival_times(
         peak_amplitudes = [float(np.log10(np.nanmax(data)))]
         burst_widths = [1e-3]  # Default 1 ms
         scattering_timescales = [0.0]
-        return arrival_times, peak_amplitudes, burst_widths, scattering_timescales
+        spectral_indices = [0.0]
+        spectral_runnings = [0.0]
+        return (
+            arrival_times,
+            peak_amplitudes,
+            burst_widths,
+            scattering_timescales,
+            spectral_indices,
+            spectral_runnings,
+        )
     
     # Set thresholds for peak detection
     height_threshold = noise_mean + min_peak_snr * noise_std
     prominence_threshold = min_peak_snr * noise_std
     
     # Find peaks using scipy's find_peaks with prominence and height requirements
-    # Require minimum width of 3 samples to avoid spurious detections
+    # Allow narrow peaks (width=1) since height and prominence thresholds filter noise
     peak_indices, properties = find_peaks(
         time_series,
         height=height_threshold,
         prominence=prominence_threshold,
-        width=3,
-        distance=5  # Minimum separation between peaks
+        width=10,  # Allow single-sample peaks for extremely narrow bursts
+        distance=20  # Minimum separation between peaks (reduced for narrow features)
     )
     
     if len(peak_indices) == 0:
@@ -307,8 +537,17 @@ def find_peak_arrival_times(
         peak_amplitudes = [float(np.log10(np.nanmax(data)))]
         burst_widths = [1e-3]
         scattering_timescales = [0.0]
+        spectral_indices = [0.0]
+        spectral_runnings = [0.0]
         print(f"[Peak finder] No peaks above SNR={min_peak_snr:.1f}, using global max")
-        return arrival_times, peak_amplitudes, burst_widths, scattering_timescales
+        return (
+            arrival_times,
+            peak_amplitudes,
+            burst_widths,
+            scattering_timescales,
+            spectral_indices,
+            spectral_runnings,
+        )
     
     # Sort peaks by height (descending) and limit to max_peaks
     peak_heights = time_series[peak_indices]
@@ -322,6 +561,8 @@ def find_peak_arrival_times(
     peak_amplitudes = []
     burst_widths = []
     scattering_timescales = []
+    spectral_indices = []
+    spectral_runnings = []
     
     # Process each peak
     for peak_idx in peak_indices:
@@ -335,7 +576,7 @@ def find_peak_arrival_times(
             amp = time_series[peak_idx]
         peak_amplitudes.append(float(np.log10(max(amp, 1e-20))))
         
-        # Measure FWHM
+        # Measure width as sigma (convert FWHM to sigma by dividing by 2.355)
         peak_val = time_series[peak_idx]
         half_max = noise_mean + (peak_val - noise_mean) / 2.0
         
@@ -349,18 +590,48 @@ def find_peak_arrival_times(
         while right_idx < len(time_series) - 1 and time_series[right_idx] > half_max:
             right_idx += 1
         
-        # Calculate FWHM
+        # Calculate FWHM and convert to sigma
         fwhm_bins = max(2, right_idx - left_idx)
         fwhm_time = fwhm_bins * dt
-        burst_widths.append(float(fwhm_time))
+        sigma = fwhm_time / 2.355  # Convert FWHM to sigma
+        burst_widths.append(float(sigma))
         
-        # Measure scattering timescale
-        scattering_tau = measure_scattering_timescale(time_series, peak_idx, dt, noise_mean)
-        scattering_timescales.append(float(scattering_tau))
+        # Measure scattering timescale from frequency-collapsed time series
+        # This is measured at the effective center frequency, so scale to reference frequency
+        scattering_tau_cfreq = measure_scattering_timescale(time_series, peak_idx, dt, noise_mean)
+        # Scale to reference frequency: tau_ref = tau_cfreq * (ref_freq / cfreq)^(-4)
+        scattering_index = -4.0
+        scattering_tau_ref = scattering_tau_cfreq * (ref_freq_mhz / cfreq_mhz) ** scattering_index
+        scattering_timescales.append(float(scattering_tau_ref))
+
+        # Spectral index / running from the frequency spectrum at this time.
+        # Use an adaptive spectral window size. For very narrow peaks, use
+        # a minimal window so the signal isn't diluted.
+        spec_bins = max(1, right_idx - left_idx)
+        spec_bins = int(min(25, spec_bins))
+        if spec_bins % 2 == 0:
+            spec_bins += 1
+
+        spec_idx, spec_run = measure_spectral_parameters(
+            data=data,
+            peak_idx=peak_idx,
+            freqs_mhz=freqs_mhz,
+            ref_freq_mhz=ref_freq_mhz,
+            time_window=spec_bins,
+        )
+        spectral_indices.append(float(spec_idx))
+        spectral_runnings.append(float(spec_run))
     
     print(f"[Peak finder] Found {len(peak_indices)} significant peak(s) above SNR={min_peak_snr:.1f}")
     
-    return arrival_times, peak_amplitudes, burst_widths, scattering_timescales
+    return (
+        arrival_times,
+        peak_amplitudes,
+        burst_widths,
+        scattering_timescales,
+        spectral_indices,
+        spectral_runnings,
+    )
 
 
 def build_fitburst_npz_from_summary(
@@ -375,6 +646,7 @@ def build_fitburst_npz_from_summary(
     override_scattering: Optional[float] = None,
     min_peak_snr: float = 6.0,
     max_peaks: int = 5,
+    diagnostic_plot: bool = False,
 ) -> str:
     """Create a fitburst-compatible .npz for Stokes I using the summary.
 
@@ -495,8 +767,8 @@ def build_fitburst_npz_from_summary(
     # Decide on output path.
     default_name = os.path.splitext(os.path.basename(dsI_path))[0] + "_fitburst.npz"
     if output_dir is None:
-        # Default: next to the summary file.
-        outdir = os.path.dirname(os.path.abspath(summary_path))
+        # Default: current working directory.
+        outdir = os.getcwd()
         output_npz = os.path.join(outdir, default_name)
     else:
         # If the argument looks like a .npz file, treat it as a full
@@ -514,18 +786,44 @@ def build_fitburst_npz_from_summary(
     # Ensure the output directory exists.
     os.makedirs(os.path.dirname(output_npz), exist_ok=True)
 
+    # Frequency axis for spectral fitting (MHz).
+    freqs_mhz = freq0_mhz + np.arange(num_freq) * df_mhz
+
     # If no arrival_time is supplied, find the main peak in the dynspec.
     if arrival_time is None:
-        arrival_times, peak_amplitudes, burst_widths, scattering_timescales = find_peak_arrival_times(
-            data_full, dt, min_peak_snr=min_peak_snr, max_peaks=max_peaks
+        (
+            arrival_times,
+            peak_amplitudes,
+            burst_widths,
+            scattering_timescales,
+            spectral_indices,
+            spectral_runnings,
+        ) = find_peak_arrival_times(
+            data_full,
+            dt,
+            freqs_mhz,
+            ref_freq_mhz,
+            cfreq_mhz,
+            min_peak_snr=min_peak_snr,
+            max_peaks=max_peaks,
         )
         num_components = len(arrival_times)
         
-        for i, (arr_t, amp, width, scat) in enumerate(zip(arrival_times, peak_amplitudes, burst_widths, scattering_timescales)):
+        for i, (arr_t, amp, width, scat, spec_idx, spec_run) in enumerate(
+            zip(
+                arrival_times,
+                peak_amplitudes,
+                burst_widths,
+                scattering_timescales,
+                spectral_indices,
+                spectral_runnings,
+            )
+        ):
             peak_bin = int(arr_t / dt)
             print(
                 f"[CELEBI→fitburst] Peak {i+1}: t={arr_t:.6e} s (bin {peak_bin}), "
-                f"log10(amp)={amp:.3f}, width={width:.6e} s, scattering={scat:.6e} s"
+                f"log10(amp)={amp:.3f}, width={width:.6e} s, scattering={scat:.6e} s, "
+                f"spectral_index={spec_idx:.3f}, spectral_running={spec_run:.3f}"
             )
     else:
         # Single component with user-specified arrival time
@@ -533,8 +831,28 @@ def build_fitburst_npz_from_summary(
         peak_amplitudes = [float(np.log10(np.nanmax(data_full)))]
         burst_widths = [1e-3]  # Default 1 ms
         scattering_timescales = [0.0]
+        peak_idx = int(np.clip(int(round(arrival_times[0] / dt)), 0, num_time - 1))
+        spec_idx, spec_run = measure_spectral_parameters(
+            data=data_full,
+            peak_idx=peak_idx,
+            freqs_mhz=freqs_mhz,
+            ref_freq_mhz=ref_freq_mhz,
+        )
+        spectral_indices = [float(spec_idx)]
+        spectral_runnings = [float(spec_run)]
         num_components = 1
         print(f"[CELEBI→fitburst] Using user-specified arrival_time = {arrival_times[0]:.6e} s")
+
+    if diagnostic_plot:
+        diag_path = os.path.splitext(output_npz)[0] + "_diagnostic.png"
+        write_diagnostic_plot(
+            data=data_full,
+            dt=dt,
+            freqs_mhz=freqs_mhz,
+            arrival_times_s=arrival_times,
+            output_path=diag_path,
+            title=os.path.basename(output_npz),
+        )
 
     # Override scattering timescale if specified
     if override_scattering is not None:
@@ -573,8 +891,8 @@ def build_fitburst_npz_from_summary(
         "ref_freq": [float(ref_freq_mhz)] * num_components,
         "scattering_index": [-4.0] * num_components,
         "scattering_timescale": scattering_timescales,
-        "spectral_index": [0.0] * num_components,
-        "spectral_running": [0.0] * num_components,
+        "spectral_index": spectral_indices,
+        "spectral_running": spectral_runnings,
     }
     print("[CELEBI→fitburst] Built metadata and burst_parameters dictionaries")
 
@@ -587,6 +905,8 @@ def build_fitburst_npz_from_summary(
 
     print(f"[CELEBI→fitburst] Wrote fitburst npz: {output_npz}")
     print(f"  data_full shape = {data_full.shape}")
+    print(f"  metadata: {metadata}")
+    print(f"  burst_parameters: { {k: (v if isinstance(v, list) else float(v)) for k, v in burst_parameters.items()} }")
     print(f"  num_freq = {num_freq}, num_time = {num_time}")
     print(f"  freq0 = {freq0_mhz:.6f} MHz, df = {df_mhz:.6f} MHz, dt = {dt:.6e} s")
     print(f"  DM = {dm_val:.6f} pc/cm^3, ref_freq = {ref_freq_mhz:.3f} MHz")
@@ -701,6 +1021,15 @@ def main(argv=None) -> int:
         ),
     )
 
+    parser.add_argument(
+        "--diagnostic-plot",
+        action="store_true",
+        help=(
+            "Write a diagnostic PNG next to the output .npz showing the dynamic "
+            "spectrum and the pulse profile with detected components labeled."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     npz_path = build_fitburst_npz_from_summary(
@@ -715,6 +1044,7 @@ def main(argv=None) -> int:
         override_scattering=args.scattering,
         min_peak_snr=args.min_snr,
         max_peaks=args.max_peaks,
+        diagnostic_plot=args.diagnostic_plot,
     )
     # Nothing else to do; pipeline should be run separately.
     return 0

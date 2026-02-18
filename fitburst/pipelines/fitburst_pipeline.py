@@ -10,10 +10,11 @@ import os
 import sys
 from copy import deepcopy
 
-import fitburst.routines.manipulate as manip
-import fitburst.utilities as ut
 import matplotlib.pyplot as plt
 import numpy as np
+
+import fitburst.routines.manipulate as manip
+import fitburst.utilities as ut
 from fitburst.analysis.fitter import LSFitter
 from fitburst.analysis.model import SpectrumModeler
 from fitburst.analysis.peak_finder import FindPeak
@@ -143,9 +144,23 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--per_component",
+    action="store",
+    dest="per_component_parameters",
+    default=[],
+    nargs="+",
+    type=str,
+    help="A list of parameters to fit per-component rather than globally. " +
+        "By default, dm, dm_index, scattering_timescale, and scattering_index " +
+        "are global (shared across all components). Use this option to fit them " +
+        "separately for each component."
+)
+
+parser.add_argument(
     "--peakfind_dist", 
     action="store", 
-    dest="peakfind_dist", default=5, 
+    dest="peakfind_dist",
+    default=5, 
     type=int,
     help="Separation used for peak-finding algorithm (for multi-component fitting)."
 )
@@ -311,6 +326,7 @@ is_folded = args.is_folded
 num_iterations = args.num_iterations
 parameters_to_fit = args.parameters_to_fit
 parameters_to_fix = args.parameters_to_fix
+per_component_parameters = args.per_component_parameters
 peakfind_rms = args.peakfind_rms
 peakfind_dist = args.peakfind_dist
 preprocess_data = args.preprocess_data
@@ -526,9 +542,18 @@ model = SpectrumModeler(
 )
 model.update_parameters(current_parameters)
 
+# compute global_parameters list based on per_component request
+default_global_parameters = ["dm", "dm_index", "scattering_timescale", "scattering_index"]
+global_parameters = [p for p in default_global_parameters if p not in per_component_parameters]
+
+if len(per_component_parameters) > 0:
+    print(f"INFO: fitting per-component for: {', '.join(per_component_parameters)}")
+    print(f"INFO: remaining global parameters: {', '.join(global_parameters)}")
+
 # now set up fitter and execute least-squares fitting
 for current_iteration in range(num_iterations):
-    fitter = LSFitter(data_windowed, model, data.good_freq, weighted_fit=True, weight_range=weight_range)
+    fitter = LSFitter(data_windowed, model, data.good_freq, weighted_fit=True, 
+                     weight_range=weight_range, global_parameters=global_parameters)
     fitter.fix_parameter(parameters_to_fix)
     fitter.fit(exact_jacobian=True)
 
@@ -539,11 +564,10 @@ for current_iteration in range(num_iterations):
         current_params = model.get_parameters_dict()
 
         if not any([x == "dm" for x in parameters_to_fix]):
-            current_params["dm"] = [x for x in bestfit_params["dm"] * num_components]
+            current_params["dm"] = bestfit_params["dm"]
 
         if "scattering_timescale" not in parameters_to_fix:
-            current_params["scattering_timescale"] = [x for x in 
-                                                      bestfit_params["scattering_timescale"] * num_components] 
+            current_params["scattering_timescale"] = bestfit_params["scattering_timescale"] 
 
         # if this is the last iteration, create best-fit model and plot windowed data.
         if current_iteration == (num_iterations - 1):

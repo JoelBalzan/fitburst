@@ -23,7 +23,7 @@ class LSFitter:
     """
 
     def __init__(self, data: float, model: object, good_freq: bool, weighted_fit: bool = True, 
-                 weight_range: list = None):
+                 weight_range: list = None, global_parameters: list = None):
         """
         Initializes object with methods and attributes defined in
         the model.SpectrumModeler() class.
@@ -46,6 +46,11 @@ class LSFitter:
             by indices of the time array (i.e., this option should receive a list of length 
             two containing integers within the range 0 ... [num_time-1].) If not set, then 
             the full range will be used.
+
+        global_parameters : list, optional
+            A list of parameter names that should be treated as global (shared across all
+            burst components) rather than per-component. If not provided, defaults to
+            ["dm", "dm_index", "scattering_timescale", "scattering_index"].
 
         Returns
         -------
@@ -72,7 +77,10 @@ class LSFitter:
 
         # set parameters for fitter configuration.
         self.good_freq = good_freq
-        self.global_parameters = ["dm", "dm_index", "scattering_timescale", "scattering_index"]
+        if global_parameters is None:
+            self.global_parameters = ["dm", "dm_index", "scattering_timescale", "scattering_index"]
+        else:
+            self.global_parameters = global_parameters
         self.success = None
         self.weights = None
         self.weighted_fit = weighted_fit
